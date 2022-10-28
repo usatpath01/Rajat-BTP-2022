@@ -1,0 +1,46 @@
+services:
+        dynamodb:
+                image: dyanmodb-mod:latest
+                container_name: my-dynamodb
+                hostname: dynamodb
+                links:
+                        - fluentd
+                volumes:
+                        - ./dynamodb/my-dynamodb-data:/home/dynamodblocal/data
+                ports:
+                        - 8000:8000
+                logging:
+                        driver: "fluentd"
+                        options:
+                                fluentd-address: "localhost:24224"
+                                tag: "{{.Name}}"
+        aws-cli:
+                image: amazon/aws-cli:latest
+                container_name: my-aws-cli
+                environment:
+                        - AWS_DEFAULT_REGION=region
+                        - AWS_ACCESS_KEY_ID=id
+                        - AWS_SECRET_ACCESS_KEY=key
+                links:
+                        - dynamodb
+                        - fluentd
+                volumes:
+                        - ./aws-cli/.aws:/root/.aws
+                entrypoint: ["aws"]
+                command: ["dynamodb","list-tables","--endpoint-url","http://dynamodb:8000"]
+                logging:
+                        driver: "fluentd"
+                        options:
+                                fluentd-address: "localhost:24224"
+                                tag: "{{.Name}}"
+        fluentd:
+                image: fluent/fluentd
+                container_name: fluentd
+                hostname: fluentd
+                environment:
+                        - FLUENTD_CONF=test.conf
+                volumes:
+                        - ./fluentd/logs/:/output/
+                        - ./fluentd/conf/:/fluentd/etc/
+                ports:
+                        - 24224:24224
