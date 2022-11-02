@@ -4,6 +4,6 @@
 int main()
 {
     FILE *fp = fopen("out.txt", "w");
-    fprintf(fp,"Hello Stdout!\n");
+    printf("Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout. Hello Stdout.");
     fprintf(stderr, "Hello Error!!\n");
 }
