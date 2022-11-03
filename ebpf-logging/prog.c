@@ -2,45 +2,98 @@
 #include <linux/sched.h>
 #include <linux/fdtable.h>
 
-#define MAX_MSG_LEN 500
+#define MAX_MSG_LEN 50
 #define MAX_FILEPATH_SIZE 100
-#define DEFAULT_SUB_BUF_LEN 10
-#define DEFAULT_SUB_BUF_SIZE 10
+#define MAX_FILE_AND_DIR_NAME_SIZE 10
+#define MAX_DIR_LEVELS_ALLOWED 6
 
 struct data_t {
-    u32 pid;    // kernel's view of the pid
-    u32 tgid;   // process's view of the pid
-    u64 ts;     // timestamp
-    char comm[TASK_COMM_LEN];   // command for the task
-    unsigned int fd;
-    char filepath[MAX_FILEPATH_SIZE];
+    u32 pid;                    /* kernel's view of the pid */
+    u32 tgid;                   /* process's view of the pid */
+    u64 ts;                     /* time in nanosecs since boot */
+    char comm[TASK_COMM_LEN];   /* command for the task */
+    unsigned int fd;            /* file descriptor */
+    char msg[MAX_MSG_LEN];      /* application log message string (lms) */
 };
 
-static int read_dentry_strings(
-    struct dentry *dtryp,
-    char buf[MAX_FILEPATH_SIZE])
+/* Compare null-terminated strings (whose sizes are known) passed for equality */
+static inline int string_cmp(
+    const unsigned char *string1,
+    const unsigned char *string2,
+    unsigned int size1,
+    unsigned int size2)
 {
-    struct dentry dtry;
-    struct dentry *lastdtryp = dtryp;
-    int nread = 0;
-    int buf_cnt = 0;
-    if (buf) {
-        bpf_probe_read_kernel(&dtry, sizeof(struct dentry), dtryp);
-        bpf_probe_read_kernel_str(buf, strlen(dtry.d_name.name), dtry.d_name.name);
-        nread++;
-        buf_cnt += strlen(dtry.d_name.name);
-        for (int i = 1; i < DEFAULT_SUB_BUF_LEN; i++) {
-            if (dtry.d_parent != lastdtryp) {
-                lastdtryp = dtry.d_parent;
-                bpf_probe_read_kernel(&dtry, sizeof(struct dentry), dtry.d_parent);
-                bpf_probe_read_kernel_str(buf + buf_cnt, strlen(dtry.d_name.name), dtry.d_name.name);
-                nread++;
-                buf_cnt += strlen(dtry.d_name.name);
-            } else
-                break;
+    if(size1 != size2) {
+        return -1;
+    }
+    for(int i = 0; i < size1; ++i) {
+        if(string1[i] != string2[i]) {
+            return -1;
         }
     }
-    return nread;
+    return 0;
+}
+
+/* SUBJECT TO CHANGE */
+/* Check if the filepath to which the write call is equal to - "/var/log/app/.*" */
+static inline int check_log_filepath(unsigned int fd) {
+    struct files_struct *files = NULL;
+    struct fdtable *fdt = NULL;
+    struct file **_fdt = NULL;
+    struct file *f = NULL;
+    struct dentry *de = NULL;
+    struct dentry *de_parent = NULL;
+
+    int nread = 0;
+    int buf_cnt = 0;
+    int i = 1;
+
+    const unsigned char dirname_var[] = {'v','a','r','\\0'};
+    const unsigned char dirname_log[] = {'l','o','g','\\0'};
+    const unsigned char dirname_app[] = {'a','p','p','\\0'};
+
+    int var_dirlevel = -1; /* Root directory is the lowest level */
+    int log_dirlevel = -1;
+    int app_dirlevel = -1;
+
+    struct task_struct *curr = (struct task_struct *)bpf_get_current_task();
+    bpf_probe_read_kernel(&files, sizeof(files), &curr->files);
+    bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
+    bpf_probe_read_kernel(&_fdt, sizeof(_fdt), &fdt->fd);
+    bpf_probe_read_kernel(&f, sizeof(f), &_fdt[fd]);
+    bpf_probe_read_kernel(&de, sizeof(de), &f->f_path.dentry);
+
+    /* Iterate up the dentry hierarchy and store the lowest levels at which
+    "var/", "log/" and "dir/" occur. If the filepath is "/var/log/app/.*" then
+    these levels occur as consecutive integers and thus return 1, else return 0 */
+    for (i = MAX_DIR_LEVELS_ALLOWED; i >= 1; --i) {
+        bpf_probe_read_kernel(&de_parent, sizeof(de_parent), &de->d_parent);
+        if(de_parent == NULL) {
+            break;
+        }
+
+        struct qstr d_name = {};
+        unsigned char name[MAX_FILEPATH_SIZE];
+        unsigned int len;
+
+        bpf_probe_read_kernel(&d_name, sizeof(d_name), &de_parent->d_name);
+        bpf_probe_read_kernel(&len, sizeof(len), &d_name.len);
+        bpf_probe_read_kernel_str(name, MAX_FILEPATH_SIZE, d_name.name);
+
+        if(string_cmp(name, dirname_var, len+1, 4) == 0) {
+            var_dirlevel = i;
+        }
+        if(string_cmp(name, dirname_log, len+1, 4) == 0) {
+            log_dirlevel = i;
+        }
+        if(string_cmp(name, dirname_app, len+1, 4) == 0) {
+            app_dirlevel = i;
+        }
+
+        de = de_parent;
+    }
+
+    return (app_dirlevel == log_dirlevel + 1 && log_dirlevel == var_dirlevel + 1);
 }
 
 BPF_PERF_OUTPUT(events);
@@ -50,42 +103,37 @@ int syscall__write(struct pt_regs *ctx,
     const char __user *buf,
 	size_t count)
 {
-    if(fd == 1 || fd == 2)
-    {
-        struct data_t data = {};
+    struct data_t data = {};
 
-        u64 tgid_pid = bpf_get_current_pid_tgid();
-        data.pid = tgid_pid;
-        data.tgid = (tgid_pid >> 32);
-        data.ts = bpf_ktime_get_ns();
-        data.fd = fd;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        // bpf_probe_read_user(data.msg, 50, (void *)buf);
+    u64 tgid_pid = bpf_get_current_pid_tgid();
+    data.pid = tgid_pid;
+    data.tgid = (tgid_pid >> 32);
 
-        struct files_struct *files = NULL;
-        struct fdtable *fdt = NULL;
-        struct file *f = NULL;
-        struct dentry *de = NULL;
-        struct qstr dn = {};
-
-        struct task_struct *curr = (struct task_struct *)bpf_get_current_task();
-        bpf_probe_read_kernel(&files, sizeof(files), &curr->files);
-        bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
-        struct file **_fd = NULL;
-        bpf_probe_read(&_fd, sizeof(_fd), &fdt->fd);
-        bpf_probe_read(&f, sizeof(f), &_fd[fd]);
-        bpf_probe_read_kernel(&de, sizeof(de), &f->f_path.dentry);
-        bpf_probe_read_kernel(&dn, sizeof(dn), &de->d_name);
-
-        read_dentry_strings(de, data.filepath);
-        
-        if(%ld == data.tgid) // do not write to perf_buffer for self
-        {
-            return 0;
-        }
-
-        events.perf_submit(ctx, &data, sizeof(data));
+    /* If the write call was made by this bcc program it's useless */
+    if(%ld == data.tgid) {
+        return 0;
     }
-    
+
+    data.ts = bpf_ktime_get_boot_ns();
+    data.fd = fd;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    /* Generate system log */
+
+    /* If write call writes to a file in the log directory, generate application log */
+    if(check_log_filepath(fd)) {
+        int i = 0;
+        int c = 5;
+        int cnt = count;
+        while(c--) {
+            bpf_probe_read_user_str(data.msg, MAX_MSG_LEN, (void *)buf);
+            events.perf_submit(ctx, &data, sizeof(data));
+            cnt -= MAX_MSG_LEN;
+            if(cnt < 0){
+                break;
+            }
+            buf = buf + MAX_MSG_LEN - 1;
+        }
+    }
     return 0;
 }
